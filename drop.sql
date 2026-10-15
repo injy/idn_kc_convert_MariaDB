@@ -1,0 +1,2 @@
+DROP FUNCTION IF EXISTS kc_to_ascii;
+DROP FUNCTION IF EXISTS kc_to_utf8;

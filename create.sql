@@ -1,0 +1,2 @@
+CREATE FUNCTION kc_to_ascii RETURNS STRING SONAME "kc_idn.so";
+CREATE FUNCTION kc_to_utf8  RETURNS STRING SONAME "kc_idn.so";

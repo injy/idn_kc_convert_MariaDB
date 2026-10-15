@@ -1,0 +1,11 @@
+SELECT "leading @ PRESERVED (the fix)" AS what, kc_to_ascii("@vche.net") AS result;
+SELECT "IDN catch-all key" AS what, kc_to_ascii("@机构.中国") AS result;
+SELECT "plain address" AS what, kc_to_ascii("nic@vche.net") AS result;
+SELECT "bare domain" AS what, kc_to_ascii("vche.net") AS result;
+SELECT "multi-level Chinese TLD" AS what, kc_to_ascii("中国.机构") AS result;
+SELECT "emoji IDN address" AS what, kc_to_ascii("🤡@😍.uz") AS result;
+SELECT "UTF-8 stored alias domain" AS what, kc_to_ascii("ω.cc") AS result;
+SELECT "ACE passthrough" AS what, kc_to_ascii("xn--bya.cc") AS result;
+SELECT "reverse direction" AS what, kc_to_utf8("xn--fiqs8s.xn--nqv7f") AS result;
+SELECT "sentinel: empty" AS what, kc_to_ascii("") AS result;
+SELECT "sentinel: two @" AS what, kc_to_ascii("a@b@c") AS result;

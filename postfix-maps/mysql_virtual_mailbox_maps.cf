@@ -1,0 +1,7 @@
+# mailbox protocol -> virtual_mailbox_maps
+# Replaces: socketmap:unix:/run/postfix/php_mysql_maps.sock:mailbox
+user = mailserver
+password = CHANGEME_DB_PASSWORD
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT username FROM mailbox WHERE kc_to_ascii(local_part) = kc_to_ascii('%u') AND kc_to_ascii(domain) = kc_to_ascii('%d') AND active=1 LIMIT 1

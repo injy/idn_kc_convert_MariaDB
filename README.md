@@ -141,6 +141,77 @@ php test/test_gbk.php
   字节的不稳定传递（在 PHP `shell_exec` 链路上实测观察到过 GBK 字节被破坏）。`--utf8`
   切换解码方向。UDF 在 SQL 中由客户端库直接传字节，不经 shell，不受影响。
 
+## 生产部署注意事项（实测踩坑）
+
+以下每一条都在 Debian 13 / MariaDB 11.8.6 / Postfix 3.10 的真实邮局上踩到并验证过，
+代价是 MariaDB 崩溃一次 + IDN 邮箱退信一次。改前请先看这里。
+
+### 1. UDF 字符串参数不是 NUL 结尾的
+
+MariaDB 传给 UDF 的字符串是**长度前缀、不带 `\0`**。直接对 `args->args[0]`
+用 `strlen()` / `strchr()` 会越过参数读到相邻内存。曾因此静默损坏多标签 ACE 域名：
+
+    kc_to_ascii('xn--fiqs8s.xn--nqv7f')  ->  xn--fiqs8s.xn--nqv7ffiqs8s   ← 串入了标签
+
+入口必须按 `args->lengths[0]` 复制并手动补 `\0`（见 `kc_idn.c` 两处 `inbuf`）。
+
+### 2. 必须保留前导 `@`（catch-all 的命门）
+
+`alias` 表的 catch-all 行存成 `@domain`（如 `@vche.net`）。查表时会用
+`kc_to_ascii(address) = CONCAT('@', ...)` 去匹配，**如果 `kc_to_ascii()` 把前导 `@`
+吃掉，左边变 `vche.net`、右边是 `@vche.net`，catch-all 永远匹配不上**，而且不报错、
+只是静默失效。所以本 UDF 明确保留前导 `@`：
+
+    kc_to_ascii('@vche.net')    -> '@vche.net'
+    kc_to_ascii('@机构.中国')   -> '@xn--nqv7f.xn--fiqs8s'
+
+### 3. 别名域里"恒等映射"必须排除，否则 IDN 邮箱退信
+
+存在一种行：`alias_domain` 把域名的 **UTF-8 写法映射到它自己的 ACE 形式**
+（如 `的.中国 → xn--hxy.xn--fiqs8s`、`α.cc → xn--mxa.cc`）。这不是真正的别名域，
+只是同一域名的 UTF-8 拼写索引；而它同时在 `domain` 表里（是邮箱域）。
+
+一旦把它当别名域用，Postfix 会认为该域"同时在 virtual_alias_domains 和
+virtual_mailbox_domains"，于是按别名域处理，该域下**所有邮箱退信**：
+
+    dsn=5.1.1, status=bounced (User unknown in virtual alias table)
+
+解决：两个映射都加上排除条件
+`AND kc_to_ascii(target_domain) <> kc_to_ascii(alias_domain)`。
+（旧 PHP 守护是裸比较列值，UTF-8 存的行从来匹配不上，所以"歪打正着"没这个问题——
+这正是它的行为需要被复刻的原因。）
+
+### 4. `postmap -q` 与线上结果不一致是正常的
+
+Postfix 的 `mail_addr_find()` 对 `virtual_alias_maps` **自带 `@domain` catch-all 回退**：
+先查 `nic@vche.net`，查不到就自动再查字面键 `@vche.net`。而 `postmap -q` 只查你给的
+那个键、**不做回退**。所以会看到：
+
+    postmap -q nic@vche.net  ->  (空)
+    线上投递                ->  injy@qq.com      ← 第二次 @vche.net 查到的
+
+排查时别误判成 UDF 不确定；要验证最终路由，用真实投递看 `/var/log/postfix/postfix.log`。
+
+### 5. 更新 `.so` 的顺序：先 DROP，再换文件，再 CREATE
+
+覆盖一个**已被加载**的 `.so` 会让 MariaDB 崩溃（实测触发 crash recovery）。
+正确顺序：
+
+```bash
+mysql -e "DROP FUNCTION IF EXISTS kc_to_ascii; DROP FUNCTION IF EXISTS kc_to_utf8;"
+cp kc_idn.so $(mariadb_config --plugindir)/     # 此时未被加载
+mysql < create.sql                               # 重新从磁盘加载
+```
+
+另外 `CREATE FUNCTION ... SONAME` 在 MariaDB 上要用**双引号**：`SONAME "kc_idn.so"`。
+
+### 6. 查日志/测映射的两个路径坑
+
+- Postfix 3.10 默认写 `maillog_file`（`/var/log/postfix/postfix.log`），
+  **不进 journald、也不进 `/var/log/mail.log`**（后者只有 rsyslog 接的 dovecot）。
+- `postmap -q` 的映射路径是相对 **`/etc/postfix`** 解析的，不是当前目录。
+  用相对路径会得到 `fatal: ..._dbname = ` 这种 misleading 报错，请写绝对路径。
+
 ## 文件
 
 ```
@@ -151,6 +222,18 @@ compare_idn.php          A/B 对拍：C UDF vs PHP 参照（编码 + 解码 + �
 test/test_robustness.php 边界/幂等/往返/模糊 + 双向对拍
 test/test_gbk.php        编码处理专项（GBK、非法字节、emoji）
 docs/robustness-report.md 验证报告与设计决策
+
+postfix-maps/            生产用的 5 个 mysql: 映射（替换 PHP socketmap 守护）
+  mysql_virtual_mailbox_domains.cf
+  mysql_virtual_mailbox_maps.cf
+  mysql_virtual_alias_domains.cf
+  mysql_virtual_alias_maps.cf       # 四级优先级，复刻 PHP 守护
+  mysql_recipient_canonical.cf      # IDN -> ACE 规范化
+  postmap_test.sh                   # 全量回归（20 项，含 IDN 与四级优先级）
+  local_delivery_test.sh / final_test.sh / live_test.sh   # 端到端投递验证
+patch_leading_at.py      给 kc_idn.c 打"保留前导 @"补丁（幂等锚点校验）
+full_sweep.sql           全表扫描：验证 UDF 改动没损坏任何存量行
+identity_check.sql       统计 alias_domain 里恒等映射 vs 真别名域的数量
 ```
 
 ## License

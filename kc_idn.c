@@ -318,6 +318,7 @@ static int kc_ascii_core(const char *in, char *out, size_t outlen)
     char domain_enc[KC_MAX_OUT];
     const char *domain_raw;
     int at_gt0 = 0;                    /* strpos() returned > 0 */
+    int leading_at = (tmp[0] == '@') ? 1 : 0;   /* keep a leading '@' */
 
     user_enc[0] = '\0';
     domain_enc[0] = '\0';
@@ -353,7 +354,7 @@ static int kc_ascii_core(const char *in, char *out, size_t outlen)
         else
             snprintf(out, outlen, "@%s", domain_enc);
     } else {
-        snprintf(out, outlen, "%s", domain_enc);
+        snprintf(out, outlen, "%s%s", leading_at ? "@" : "", domain_enc);
     }
     return 0;
 }
@@ -380,6 +381,7 @@ static int kc_utf8_core(const char *in, char *out, size_t outlen)
     char domain_dec[KC_MAX_OUT];
     const char *domain_raw;
     int at_gt0 = 0;
+    int leading_at = (tmp[0] == '@') ? 1 : 0;   /* keep a leading '@' */
 
     user_dec[0] = '\0';
     domain_dec[0] = '\0';
@@ -408,7 +410,7 @@ static int kc_utf8_core(const char *in, char *out, size_t outlen)
         else
             snprintf(out, outlen, "@%s", domain_dec);
     } else {
-        snprintf(out, outlen, "%s", domain_dec);
+        snprintf(out, outlen, "%s%s", leading_at ? "@" : "", domain_dec);
     }
     return 0;
 }
@@ -534,8 +536,18 @@ char *kc_to_ascii(UDF_INIT *initid, UDF_ARGS *args,
         *is_null = 1;
         return NULL;
     }
+    /* MariaDB passes string UDF args as length-prefixed, NOT NUL-terminated.
+     * Copy into a properly terminated local buffer before any strlen/strchr
+     * work, otherwise we scan past the argument into adjacent memory. */
+    char inbuf[KC_MAX_OUT];
+    size_t inlen = args->lengths[0];
+    if (inlen >= KC_MAX_OUT)
+        inlen = KC_MAX_OUT - 1;
+    memcpy(inbuf, args->args[0], inlen);
+    inbuf[inlen] = '\0';
+
     char *out = initid->ptr;
-    if (kc_ascii_core(args->args[0], out, KC_MAX_OUT) != 0) {
+    if (kc_ascii_core(inbuf, out, KC_MAX_OUT) != 0) {
         *is_null = 1;
         return NULL;
     }
@@ -579,8 +591,18 @@ char *kc_to_utf8(UDF_INIT *initid, UDF_ARGS *args,
         *is_null = 1;
         return NULL;
     }
+    /* MariaDB passes string UDF args as length-prefixed, NOT NUL-terminated.
+     * Copy into a properly terminated local buffer before any strlen/strchr
+     * work, otherwise we scan past the argument into adjacent memory. */
+    char inbuf[KC_MAX_OUT];
+    size_t inlen = args->lengths[0];
+    if (inlen >= KC_MAX_OUT)
+        inlen = KC_MAX_OUT - 1;
+    memcpy(inbuf, args->args[0], inlen);
+    inbuf[inlen] = '\0';
+
     char *out = initid->ptr;
-    if (kc_utf8_core(args->args[0], out, KC_MAX_OUT) != 0) {
+    if (kc_utf8_core(inbuf, out, KC_MAX_OUT) != 0) {
         *is_null = 1;
         return NULL;
     }

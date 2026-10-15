@@ -1,0 +1,26 @@
+# alias_domain protocol -> virtual_alias_domains
+# Replaces: socketmap:unix:/run/postfix/php_mysql_maps.sock:alias_domain
+#
+# IMPORTANT: rows where the domain maps to its OWN ACE form
+# (kc_to_ascii(target_domain) = kc_to_ascii(alias_domain)) are NOT real alias
+# domains -- they are just the UTF-8 spelling of a domain that is already a
+# virtual_mailbox_domains row.  On this server ALL 25 alias_domain rows are of
+# that identity kind (verified: 25 identity, 0 genuine).
+#
+# They MUST be excluded here, otherwise Postfix sees the domain listed in BOTH
+# virtual_alias_domains and virtual_mailbox_domains, classifies it as an alias
+# domain, and every mailbox at such a domain bounces with
+#   "User unknown in virtual alias table"
+# instead of being delivered locally via LMTP.
+#
+# The old PHP daemon only ever compared the raw column value, so it never
+# matched these UTF-8-stored rows and therefore never hit this problem -- that
+# behaviour is preserved here by the explicit identity exclusion.
+#
+# Lookups stay form-agnostic (kc_to_ascii on both sides) so a row stored as
+# punycode/ACE or as native UTF-8 both match.
+user = mailserver
+password = CHANGEME_DB_PASSWORD
+hosts = 127.0.0.1
+dbname = mailserver
+query = SELECT target_domain FROM alias_domain WHERE kc_to_ascii(alias_domain)=kc_to_ascii('%s') AND kc_to_ascii(target_domain) <> kc_to_ascii(alias_domain) LIMIT 1
