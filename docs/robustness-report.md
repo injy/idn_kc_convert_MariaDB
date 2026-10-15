@@ -1,9 +1,10 @@
-# kc_punycode 验证报告
+# kc_idn 验证报告
 
 验证时间：2026-10-15
-验证对象：MariaDB UDF `kc_punycode`（`kc_punycode.c`，standalone 编译版）
+验证对象：MariaDB UDF `kc_idn`（`kc_idn.c`，standalone 编译版，导出 `kc_to_ascii` 与
+`kc_to_utf8` 两个函数）
 基准：仓库内 PHP 参照实现 `php_idn_kc_convert.php`（= 邮局生产函数 `idn_kc_convert()`
-去掉编码猜测分支后的语义等价版）
+去掉编码猜测分支后，拆为 `kc_to_ascii` / `kc_to_utf8` 两个显式方向函数的语义等价版）
 环境：Debian 13.7 / gcc / libidn2 2.3.8 / PHP 8.4.25（intl、mbstring）
 
 ## 结论
@@ -13,7 +14,7 @@ UDF 可安全替代 PHP 转换层用于 Postfix/Dovecot 原生 `mysql:` 查表�
 
 | 测试 | 用例数 | 结果 |
 |---|---|---|
-| A/B 对拍（compare_idn.php） | 38 | 38/38 PASS |
+| A/B 对拍（compare_idn.php：A 编码 41 / B 解码 22 / C 往返 41） | 104 | 104/104 PASS |
 | 边界硬断言（A/B/C/F 段） | 22 | 22/22 PASS |
 | PHP vs C 对拍（D 段） | 28 | 28/28，零差异 |
 | 模糊测试（G 段） | 200 | 0 抛出 |
@@ -47,9 +48,11 @@ libidn2 的 UTF-8 解码器是**宽松**的：遇到非法字节会跳过坏字�
 `d6 d0 b9 fa`（"中国"）会被解成 U+0409 并生成一个假 ACE 标签；ICU 的 `idn_to_ascii`
 则是**严格失败**（返回 false → `''`）。
 
-因此 `kc_puny_side()` 先做严格 UTF-8 校验（拒绝过长编码、代理区、>U+10FFFF），
-非法输入直接按"转换失败"处理返回 `''`，与 PHP 完全一致。修复前用 `--hex` 直传
-GBK 字节可复现分歧，修复后 GBK 输入双方均返回 `''`（查不到 → 拒信，不崩溃、不损坏）。
+因此 `kc_puny_side()`（编码方向）与 `kc_utf8_side()`（解码方向）都先做严格
+UTF-8 校验（拒绝过长编码、代理区、>U+10FFFF），非法输入直接按"转换失败"处理返回
+`''`，与 PHP 完全一致。修复前用 `--hex` 直传 GBK 字节可复现分歧，修复后 GBK 输入
+双方均返回 `''`（查不到 → 拒信，不崩溃、不损坏）。解码方向用 `idn2_to_unicode_8z8z`
+（同样 `IDN2_TRANSITIONAL`），保证 `kc_to_utf8(kc_to_ascii(x)) == x`。
 
 ### 3. 过滤必须两遍且先剥离后折叠
 
@@ -60,7 +63,8 @@ PHP 原版是两个独立的 `preg_replace`：先删危险字符，再把连续 
 ### 4. 哨兵值与失败返回
 
 PHP 的边界行为被逐一复刻：空输入 → `no_input`；多 `@` → `too_many_at_2+`；
->200 字节 → `input_too_long`；`idn_to_ascii` 失败 → `false`（字符串上下文为 `''`）。
+>200 字节 → `input_too_long`；`idn_to_ascii` / `idn_to_utf8` 失败 → `false`
+（字符串上下文为 `''`）。
 这些值作为查表键都匹配不到任何行，与 PHP 版等效（拒信），但保持了行为一致，
 便于两层并存期做 `postmap -q` 比对。
 
@@ -91,6 +95,23 @@ if ($encoding !== 'UTF-8') { $input = mb_convert_encoding($input, 'UTF-8', $enco
 一并消除。在邮局生产库的全部 IDN 邮箱上端到端回放（Unicode 入参 → 转换 → 查库），
 修正后全部命中库中存储的 punycode 行。
 
+### 6. 解码方向（kc_to_utf8）用 toASCII→toUnicode 两步实现
+
+`kc_to_utf8` 要逐字节对齐 PHP 的 `idn_to_utf8(..., UTS46)`。实测 libidn2 的
+`idn2_to_unicode_8z8z` **只解码 ACE 标签、对未编码（非 ACE）输入原样返回**
+（`faß.de`→`faß.de`、`K.de`→`K.de`），而 ICU 的 `idn_to_utf8` 会对**每个标签**做
+完整 UTS46 映射（ß→ss、Ⅰ→i、大写→小写）。直接调 `idn2_to_unicode_8z8z` 会让解码
+方向与 PHP 在 8 类非 punycode 输入上分歧。
+
+修复：解码侧先 `idn2_to_ascii_8z`（应用 UTS46 映射）→ 再 `idn2_to_unicode_8z8z`
+（解码 ACE）。这一步等价复刻 `idn_to_utf8` 对 ACE 与非 ACE 输入的行为，同时
+保证 `kc_to_utf8(kc_to_ascii(x)) == x`。
+
+注意一个边界：单个裸 ASCII 标签长度 > 63 字节（如 200 个 `x`）不是合法邮件组件、
+也绝不会是库里存的用户名；libidn2 以 `IDN2_TOO_BIG` 拒绝，ICU 在 `idn_to_utf8` 中
+放宽了该限制。该病态输入只在编码方向与健壮性套件覆盖（转换失败→`''`），解码方向
+的对拍用例刻意排除它（详见 compare_idn.php 注释），避免无意义的等值断言。
+
 ## 测试链路的两个坑（已绕过，供复用者注意）
 
 1. **PHP `shell_exec` → shell → argv 传原始字节不可靠**：实测 GBK 字节在该链路上会被
@@ -106,4 +127,6 @@ if ($encoding !== 'UTF-8') { $input = mb_convert_encoding($input, 'UTF-8', $enco
   注册需在目标数据库环境执行（属生产变更，另行授权后进行）。
 - 输入含内嵌 NUL 字节时 C 侧会在 NUL 处截断（PHP 字符串二进制安全）。邮件地址
   不可能含 NUL（Postfix 拒绝），不影响使用。
-- 反向转换（`idn_to_utf8` 方向）未实现，查表场景不需要。
+- 反向函数 `kc_to_utf8`（punycode → UTF-8）已实现并与 PHP `idn_to_utf8` 对拍一致；
+  用途是出库展示 / 回信路由（把库里存的 punycode 用户名还原成可读 IDN），
+  以及保证 `kc_to_utf8(kc_to_ascii(x)) == x` 的往返一致性。

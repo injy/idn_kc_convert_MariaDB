@@ -1,14 +1,14 @@
 #!/usr/bin/php
 <?php
 /**
- * Robustness + parity harness for idn_kc_convert() (PHP reference) and the
- * kc_punycode UDF (C).
+ * Robustness + parity harness for kc_to_ascii()/kc_to_utf8() (PHP reference)
+ * and the kc_idn UDF (C).
  *
  * Goals:
- *   1. Prove idn_kc_convert() never throws / never crashes on nasty input.
+ *   1. Prove the reference never throws / never crashes on nasty input.
  *   2. Check its documented error/edge behaviour (empty, multi-@, too long).
  *   3. Check idempotency on already-punycode input.
- *   4. Cross-check ENCODE output against the compiled C kc_punycode binary
+ *   4. Cross-check ENCODE/DECODE output against the compiled C kc_idn binary
  *      (the UDF) and report every divergence.
  *   5. Detect transitional-vs-non-transitional drift on ß / roman numerals.
  *   6. Roundtrip decode(encode(x)) and fuzz for crash-safety.
@@ -23,7 +23,7 @@
  * Requires PHP with intl (idn_to_ascii/idn_to_utf8) and mbstring.
  */
 
-$bin = $argv[1] ?? (getenv('KC_BIN') ?: __DIR__ . '/../kc_punycode_test');
+$bin = $argv[1] ?? (getenv('KC_BIN') ?: __DIR__ . '/../kc_idn_test');
 $ref = getenv('KC_PHP_REF') ?: __DIR__ . '/../php_idn_kc_convert.php';
 
 if (!is_file($ref)) {
@@ -43,24 +43,25 @@ require $ref;
 function run_php($a, $utf = true)
 {
     try {
-        // NOTE: idn_kc_convert() returns the boolean false (not '') when
-        // idn_to_ascii() fails on a bare domain.  Every consumer (socketmap
-        // daemon, MySQL UDF) sees it in string context, i.e. '' - so the
-        // harness works with the string value throughout.
-        $r = (string) idn_kc_convert($a, $utf);
+        // kc_to_ascii() = encode (UTF-8/IDN -> punycode); kc_to_utf8() = decode.
+        // Both return '' (false in string context) when conversion fails.
+        // Every consumer (socketmap daemon, MySQL UDF) sees it in string
+        // context, i.e. '' - so the harness works with the string value.
+        $r = $utf ? (string) kc_to_ascii($a) : (string) kc_to_utf8($a);
         return [$r, null];
     } catch (\Throwable $e) {
         return [null, get_class($e) . ': ' . $e->getMessage()];
     }
 }
 
-function run_c($bin, $a)
+function run_c($bin, $a, $utf8 = false)
 {
     if (!$bin || !is_executable($bin)) return null;
     // --hex mode: pass the input hexlified so arbitrary bytes (invalid
     // UTF-8, GBK, control chars) survive the shell/argv hop unchanged.
     // escapeshellarg keeps an empty input as an explicit '' argument.
-    $out = @shell_exec(escapeshellarg($bin) . ' --hex ' . escapeshellarg(bin2hex($a)) . ' 2>/dev/null');
+    $cmd = escapeshellarg($bin) . ($utf8 ? ' --utf8' : '') . ' --hex ' . escapeshellarg(bin2hex($a));
+    $out = @shell_exec($cmd . ' 2>/dev/null');
     return $out === null ? null : rtrim($out, "\n");
 }
 
@@ -140,6 +141,29 @@ $parity_cases = [
 foreach ($parity_cases as $in) {
     [$php, $e] = run_php($in);
     $c = run_c($bin, $in);
+    if ($c === null) continue;
+    $parity_n++;
+    $same = ($php === $c);
+    if (!$same) $mismatch++;
+    printf("  [%-4s] php=%-40s c=%-40s | in=%s\n",
+        $same ? 'OK  ' : 'DIFF',
+        json_encode($php, JSON_UNESCAPED_UNICODE),
+        json_encode($c, JSON_UNESCAPED_UNICODE),
+        $in);
+}
+
+echo "\n==============================================================\n";
+echo "D2. PHP vs C UDF PARITY  (decode direction)\n";
+echo "==============================================================\n";
+$decode_cases = [
+    'xn--fiq228c@xn--fiq228c.xn--fiqs8s', 'xn--fiq228c.xn--fiqs8s',
+    'xn--mller-kva.de', 'xn--e1t202ftnn@xn--ue4at70a.xn--fiqs8s',
+    'user@example.com', '@example.com', 'foo@',
+    'xn--i1a.xn--fiqs8s', str_repeat('x', 201), 'a@b@c.com',
+];
+foreach ($decode_cases as $in) {
+    [$php, $e] = run_php($in, false);
+    $c = run_c($bin, $in, true);
     if ($c === null) continue;
     $parity_n++;
     $same = ($php === $c);
