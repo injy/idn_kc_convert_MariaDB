@@ -1,0 +1,4 @@
+# build artefacts
+*.o
+*.so
+kc_punycode_test

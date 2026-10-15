@@ -1,0 +1,2 @@
+# normalise to LF everywhere - this project targets Linux (make/gcc/PHP-CLI)
+* text=auto eol=lf
