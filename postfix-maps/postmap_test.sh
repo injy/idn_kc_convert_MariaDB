@@ -40,9 +40,11 @@ q mysql_recipient_canonical.cf "美丽@的.中国"   "xn--viq251j@xn--hxy.xn--fi
 q mysql_recipient_canonical.cf "中国.机构"      "xn--fiqs8s.xn--nqv7f"
 q mysql_recipient_canonical.cf "nic@vche.net"   "nic@vche.net"
 
-echo "--- virtual_alias_maps: 4-step priority (mirrors PHP daemon) ---"
-q mysql_virtual_alias_maps.cf "test@vche.net"      "injy@qq.com"   # 1 specific
-q mysql_virtual_alias_maps.cf "nic@vche.net"       ""              # 3 mailbox exists
+echo "--- virtual_alias_maps: 1对1转发 > 真实邮箱 > catch-all ---"
+q mysql_virtual_alias_maps.cf "test@vche.net"      "injy@qq.com"   # 1 specific alias
+q mysql_virtual_alias_maps.cf "nic@vche.net"       "nic@vche.net"  # 3 real mailbox -> address ITSELF (suppresses native @domain fallback)
+q mysql_virtual_alias_maps.cf "xn--viq251j@xn--hxy.xn--fiqs8s" "xn--viq251j@xn--hxy.xn--fiqs8s"  # 3 IDN mailbox -> itself
+q mysql_virtual_alias_maps.cf "xn--9p9h@xn--r28h.uz"           "xn--9p9h@xn--r28h.uz"            # 3 emoji mailbox -> itself
 q mysql_virtual_alias_maps.cf "zztest999@vche.net" "injy@qq.com"   # 4 catch-all
-q mysql_virtual_alias_maps.cf "xn--viq251j@xn--hxy.xn--fiqs8s" ""  # mailbox, no catch-all
-q mysql_virtual_alias_maps.cf "xn--9p9h@xn--r28h.uz"           ""  # emoji mailbox
+q mysql_virtual_alias_maps.cf "@vche.net"          "injy@qq.com"   # native catch-all key (Postfix's own fallback query)
+q mysql_virtual_alias_maps.cf "nobody@diy.gd"      ""              # no mailbox, no catch-all

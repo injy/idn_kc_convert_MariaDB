@@ -181,14 +181,21 @@ virtual_mailbox_domains"，于是按别名域处理，该域下**所有邮箱退
 （旧 PHP 守护是裸比较列值，UTF-8 存的行从来匹配不上，所以"歪打正着"没这个问题——
 这正是它的行为需要被复刻的原因。）
 
-### 4. `postmap -q` 与线上结果不一致是正常的
+### 4. `postmap -q` 与线上结果不一致是正常的——且它决定收件优先级
 
 Postfix 的 `mail_addr_find()` 对 `virtual_alias_maps` **自带 `@domain` catch-all 回退**：
-先查 `nic@vche.net`，查不到就自动再查字面键 `@vche.net`。而 `postmap -q` 只查你给的
-那个键、**不做回退**。所以会看到：
+先查完整地址，**只有返回 NOTFOUND 时**才自动再查字面键 `@domain`。而 `postmap -q` 只查
+你给的那个键、**不做回退**。所以会看到：
 
     postmap -q nic@vche.net  ->  (空)
     线上投递                ->  injy@qq.com      ← 第二次 @vche.net 查到的
+
+**这个回退机制直接决定收件优先级**：本地邮箱存在时，映射必须返回**地址本身**
+（`THEN '%s'`）而不是 NULL。返回 NULL = NOTFOUND = 触发回退 = 真实邮箱被 catch-all
+劫持；返回地址本身 = 查询成功 = 不回退 = 落到 `virtual_mailbox_maps` 本地投递。
+最终优先级：
+
+    1对1转发(alias 行) > 真实邮箱(返回自身) > catch-all(@domain)
 
 排查时别误判成 UDF 不确定；要验证最终路由，用真实投递看 `/var/log/postfix/postfix.log`。
 
@@ -212,6 +219,25 @@ mysql < create.sql                               # 重新从磁盘加载
 - `postmap -q` 的映射路径是相对 **`/etc/postfix`** 解析的，不是当前目录。
   用相对路径会得到 `fatal: ..._dbname = ` 这种 misleading 报错，请写绝对路径。
 
+### 7. 邮件存储迁移到数据盘（/www/vmail -> /data/vmail）
+
+邮局邮件原本在系统盘的 `/www/vmail`，数据盘挂在 `/data`（ext4）。迁移要点：
+
+- 数据：`rsync -aHAX --numeric-ids /www/vmail/ /data/vmail/`（保留 `vmail:mail`
+  属主与 maildir 结构），完成后用 `diff -rq` 校验一致性。
+  注意 `/www/vmail` 里除了域目录还有邮局插件的 SQLite 库（`postfixadmin.db` 等），
+  一并带走。
+- 引用点共 4 处（迁移前用 `grep -rn /www/vmail /etc` 全量列出）：
+  1. `/etc/postfix/main.cf`：`virtual_mailbox_base`
+  2. `/etc/dovecot/conf.d/auth-sql.conf.ext`：userdb 的
+     `CONCAT('/www/vmail/', domain, '/', local_part)`
+  3. `/etc/dovecot/conf.d/10-mail.conf`：`mail_path`
+  4. `/etc/dovecot/dovecot-sql.conf.ext`：死配置（无人 include），顺手改
+- 顺序：**先停 dovecot**（Postfix 继续收信，LMTP 连不上自动进 deferred 队列），
+  rsync → 改配置 → 起 dovecot → `postqueue -f` 补投。全程 SMTP 不拒信。
+- `mailbox.maildir` 列存的是相对路径（`nic@vche.net/`），不用改。
+- 迁移后 `/www/vmail` 原样保留作备份，确认无误再删。
+
 ## 文件
 
 ```
@@ -227,10 +253,16 @@ postfix-maps/            生产用的 5 个 mysql: 映射（替换 PHP socketmap
   mysql_virtual_mailbox_domains.cf
   mysql_virtual_mailbox_maps.cf
   mysql_virtual_alias_domains.cf
-  mysql_virtual_alias_maps.cf       # 四级优先级，复刻 PHP 守护
+  mysql_virtual_alias_maps.cf       # 优先级：1对1转发 > 真实邮箱 > catch-all
   mysql_recipient_canonical.cf      # IDN -> ACE 规范化
-  postmap_test.sh                   # 全量回归（20 项，含 IDN 与四级优先级）
+  postmap_test.sh                   # 全量回归（24 项，含 IDN 与优先级矩阵）
+  deploy_alias_priority.sh          # 部署别名映射 + 优先级矩阵验证
+  live_priority_test.sh             # 真实投递验证优先级（本地 vs catch-all）
   local_delivery_test.sh / final_test.sh / live_test.sh   # 端到端投递验证
+inspect_migration.sh     迁移前盘点（磁盘/引用点/nic 状态）
+preflight.sh             迁移前预检（遗留 .db、maildir 列、lmtp 监听）
+migrate_vmail.sh         /www/vmail -> /data/vmail 一键迁移（含失败回滚）
+verify_migration.sh      迁移后验证（新路径投递/历史邮件/emoji IDN）
 patch_leading_at.py      给 kc_idn.c 打"保留前导 @"补丁（幂等锚点校验）
 full_sweep.sql           全表扫描：验证 UDF 改动没损坏任何存量行
 identity_check.sql       统计 alias_domain 里恒等映射 vs 真别名域的数量
