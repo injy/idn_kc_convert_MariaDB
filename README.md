@@ -238,6 +238,55 @@ mysql < create.sql                               # 重新从磁盘加载
 - `mailbox.maildir` 列存的是相对路径（`nic@vche.net/`），不用改。
 - 迁移后 `/www/vmail` 原样保留作备份，确认无误再删。
 
+### 8. 那堆 `.db` 文件为什么还在（SQLite 空壳真相）
+
+主库早已全部迁到 MySQL（`mailserver` 库，Postfix/Dovecot/UDF 都只读它）。
+`/www/vmail` 下的 `postfixadmin.db` / `dovecot.db` / `mail_unsubscribe.db` /
+`auto_reply.db` / `postfixmaillog.db` / `automations.db` / `abnormal_recipient.db`
+`/vmail.db` 共 8 个 SQLite 文件**全是宝塔(aaPanel)遗留空壳**，
+
+根因：宝塔邮局插件自带一个透明适配器
+`/www/server/panel/plugin/mail_sys/mysql_shim.py`（文件头注释
+"SQLite -> MySQL 透明适配器 v2"）。它 **monkeypatch 了 `sqlite3.connect()`**，
+把所有 `sqlite3.connect('/www/vmail/xxx.db')` 重定向到 MySQL 的 `mailserver` 库
+（`SQLITE_DB_MAP` 里那 5 条映射）。运行时**没有任何进程真正打开这些 `.db` 文件**
+（实测 `lsof` 无占用、`postfixadmin.db` 的 mtime 7/29 11:03 恰好对应适配器上线，
+有 `.pre_shim.20260729` 备份佐证）。它们不影响任何邮件路由，迁移时一并拷到
+`/data/vmail` 也无副作用。
+
+插件代码（`mysql_adapter.py`、`class/mailUnsubscribe.py`）里仍写着
+`sqlite3.connect('/www/vmail/postfixadmin.db')`，但执行时已被 shim 接管转向 MySQL。
+
+### 9. Dovecot 2.4 配额修复（`doveadm quota get` 只出表头）
+
+故障现象：`doveadm quota get -u xxx` 只打印表头，不显示 STORAGE/MESSAGE 用量。
+根因：配额后端 `quota = maildir` 原本写在 `/etc/dovecot/90-quota.conf`
+（在 `conf.d/` **上一层**），`!include conf.d/*.conf` 从不加载它；而 `conf.d/` 下
+那份被改名成空的 `90-quota.conf.old`。于是**配额后端从未加载**。
+
+Dovecot 2.4 配额语法相对旧版有 3 处巨变，踩坑点：
+1. **删除了 `plugin { }` 区块** —— `plugin { quota = ... }` 直接报
+   `Unknown section name: plugin`。
+2. 配额根用**命名列表过滤器**语法：`quota maildir { }`（冒号写法
+   `quota = maildir:maildir` 或 `quota maildir:maildir { }` 都错）。
+3. 根存储限额设置名是 `quota_storage_size`（裸字节，如
+   `quota_storage_size = 1073741824`）；`quota_rule` 只用于单邮箱额外额度
+   （如 Trash），**不是根限额**。从 SQL userdb 返回的额外字段必须加 `userdb_`
+   前缀（如 `userdb_quota_storage_size`），否则被当成 passdb 字段忽略。
+
+修复：在真正加载的 `/etc/dovecot/conf.d/90-quota.conf` 写入
+`quota maildir { }`，后端生效，`doveadm quota get` 开始显示真实用量。
+
+**安全决策：不启用按用户硬限额。** 2.4 下从 userdb 下发根限额的嵌套字段命名
+极脆弱（试遍 `quota_rule` / `quota_quota_rule` / `userdb_quota_rule` /
+`userdb_quota_storage_size` 加 `*:storage=` / `maildir:storage=` / 裸字节均不绑）。
+对照实验证明区块内 `quota_storage_size = <裸字节>` 才能正常显示 Limit。
+但启用硬限额会让已超限的 `et.et/et`（54.5MB > 50MB）**立即被拒收**。
+故保留后端用量可见、Limit 显示 `-`（= 不强制）即为安全状态。
+
+相关文件：`90-quota.conf`（修复后的后端块）、`fix_authsql.py`
+（还原面板原始 userdb quota 写法）、`deploy_quota_fix.sh`（备份+部署+reload）。
+
 ## 文件
 
 ```
@@ -263,6 +312,9 @@ inspect_migration.sh     迁移前盘点（磁盘/引用点/nic 状态）
 preflight.sh             迁移前预检（遗留 .db、maildir 列、lmtp 监听）
 migrate_vmail.sh         /www/vmail -> /data/vmail 一键迁移（含失败回滚）
 verify_migration.sh      迁移后验证（新路径投递/历史邮件/emoji IDN）
+90-quota.conf            Dovecot 2.4 配额后端修复块（quota maildir { }）
+fix_authsql.py           还原 auth-sql.conf.ext 的 userdb quota 写法
+deploy_quota_fix.sh      配额修复部署脚本（备份+部署+reload+校验）
 patch_leading_at.py      给 kc_idn.c 打"保留前导 @"补丁（幂等锚点校验）
 full_sweep.sql           全表扫描：验证 UDF 改动没损坏任何存量行
 identity_check.sql       统计 alias_domain 里恒等映射 vs 真别名域的数量
