@@ -212,112 +212,21 @@ mysql < create.sql                               # 重新从磁盘加载
 
 另外 `CREATE FUNCTION ... SONAME` 在 MariaDB 上要用**双引号**：`SONAME "kc_idn.so"`。
 
-### 6. 查日志/测映射的两个路径坑
-
-- Postfix 3.10 默认写 `maillog_file`（`/var/log/postfix/postfix.log`），
-  **不进 journald、也不进 `/var/log/mail.log`**（后者只有 rsyslog 接的 dovecot）。
-- `postmap -q` 的映射路径是相对 **`/etc/postfix`** 解析的，不是当前目录。
-  用相对路径会得到 `fatal: ..._dbname = ` 这种 misleading 报错，请写绝对路径。
-
-### 7. 邮件存储迁移到数据盘（/www/vmail -> /data/vmail）
-
-邮局邮件原本在系统盘的 `/www/vmail`，数据盘挂在 `/data`（ext4）。迁移要点：
-
-- 数据：`rsync -aHAX --numeric-ids /www/vmail/ /data/vmail/`（保留 `vmail:mail`
-  属主与 maildir 结构），完成后用 `diff -rq` 校验一致性。
-  注意 `/www/vmail` 里除了域目录还有邮局插件的 SQLite 库（`postfixadmin.db` 等），
-  一并带走。
-- 引用点共 4 处（迁移前用 `grep -rn /www/vmail /etc` 全量列出）：
-  1. `/etc/postfix/main.cf`：`virtual_mailbox_base`
-  2. `/etc/dovecot/conf.d/auth-sql.conf.ext`：userdb 的
-     `CONCAT('/www/vmail/', domain, '/', local_part)`
-  3. `/etc/dovecot/conf.d/10-mail.conf`：`mail_path`
-  4. `/etc/dovecot/dovecot-sql.conf.ext`：死配置（无人 include），顺手改
-- 顺序：**先停 dovecot**（Postfix 继续收信，LMTP 连不上自动进 deferred 队列），
-  rsync → 改配置 → 起 dovecot → `postqueue -f` 补投。全程 SMTP 不拒信。
-- `mailbox.maildir` 列存的是相对路径（`nic@vche.net/`），不用改。
-- 迁移后 `/www/vmail` 原样保留作备份，确认无误再删。
-
-### 8. 那堆 `.db` 文件为什么还在（SQLite 空壳真相）
-
-主库早已全部迁到 MySQL（`mailserver` 库，Postfix/Dovecot/UDF 都只读它）。
-`/www/vmail` 下的 `postfixadmin.db` / `dovecot.db` / `mail_unsubscribe.db` /
-`auto_reply.db` / `postfixmaillog.db` / `automations.db` / `abnormal_recipient.db`
-`/vmail.db` 共 8 个 SQLite 文件**全是宝塔(aaPanel)遗留空壳**，
-
-根因：宝塔邮局插件自带一个透明适配器
-`/www/server/panel/plugin/mail_sys/mysql_shim.py`（文件头注释
-"SQLite -> MySQL 透明适配器 v2"）。它 **monkeypatch 了 `sqlite3.connect()`**，
-把所有 `sqlite3.connect('/www/vmail/xxx.db')` 重定向到 MySQL 的 `mailserver` 库
-（`SQLITE_DB_MAP` 里那 5 条映射）。运行时**没有任何进程真正打开这些 `.db` 文件**
-（实测 `lsof` 无占用、`postfixadmin.db` 的 mtime 7/29 11:03 恰好对应适配器上线，
-有 `.pre_shim.20260729` 备份佐证）。它们不影响任何邮件路由，迁移时一并拷到
-`/data/vmail` 也无副作用。
-
-插件代码（`mysql_adapter.py`、`class/mailUnsubscribe.py`）里仍写着
-`sqlite3.connect('/www/vmail/postfixadmin.db')`，但执行时已被 shim 接管转向 MySQL。
-
-### 9. Dovecot 2.4 配额修复（`doveadm quota get` 只出表头）
-
-故障现象：`doveadm quota get -u xxx` 只打印表头，不显示 STORAGE/MESSAGE 用量。
-根因：配额后端 `quota = maildir` 原本写在 `/etc/dovecot/90-quota.conf`
-（在 `conf.d/` **上一层**），`!include conf.d/*.conf` 从不加载它；而 `conf.d/` 下
-那份被改名成空的 `90-quota.conf.old`。于是**配额后端从未加载**。
-
-Dovecot 2.4 配额语法相对旧版有 3 处巨变，踩坑点：
-1. **删除了 `plugin { }` 区块** —— `plugin { quota = ... }` 直接报
-   `Unknown section name: plugin`。
-2. 配额根用**命名列表过滤器**语法：`quota maildir { }`（冒号写法
-   `quota = maildir:maildir` 或 `quota maildir:maildir { }` 都错）。
-3. 根存储限额设置名是 `quota_storage_size`（裸字节，如
-   `quota_storage_size = 1073741824`）；`quota_rule` 只用于单邮箱额外额度
-   （如 Trash），**不是根限额**。从 SQL userdb 返回的额外字段必须加 `userdb_`
-   前缀（如 `userdb_quota_storage_size`），否则被当成 passdb 字段忽略。
-
-修复：在真正加载的 `/etc/dovecot/conf.d/90-quota.conf` 写入
-`quota maildir { }`，后端生效，`doveadm quota get` 开始显示真实用量。
-
-**安全决策：不启用按用户硬限额。** 2.4 下从 userdb 下发根限额的嵌套字段命名
-极脆弱（试遍 `quota_rule` / `quota_quota_rule` / `userdb_quota_rule` /
-`userdb_quota_storage_size` 加 `*:storage=` / `maildir:storage=` / 裸字节均不绑）。
-对照实验证明区块内 `quota_storage_size = <裸字节>` 才能正常显示 Limit。
-但启用硬限额会让已超限的 `et.et/et`（54.5MB > 50MB）**立即被拒收**。
-故保留后端用量可见、Limit 显示 `-`（= 不强制）即为安全状态。
-
-相关文件：`90-quota.conf`（修复后的后端块）、`fix_authsql.py`
-（还原面板原始 userdb quota 写法）、`deploy_quota_fix.sh`（备份+部署+reload）。
-
 ## 文件
 
 ```
-kc_idn.c                UDF 源码（单文件；#ifdef STANDALONE_TEST 内含测试 main）
+kc_idn.c                 UDF 源码（单文件；#ifdef STANDALONE_TEST 内含测试 main）
+looptest.c               libidn2 转换（UTS46 transitional）幂等性独立验证
 Makefile                 standalone / udf / test / clean
 php_idn_kc_convert.php   PHP 参照实现（kc_to_ascii / kc_to_utf8，语义基准）
 compare_idn.php          A/B 对拍：C UDF vs PHP 参照（编码 + 解码 + 往返）
 test/test_robustness.php 边界/幂等/往返/模糊 + 双向对拍
 test/test_gbk.php        编码处理专项（GBK、非法字节、emoji）
 docs/robustness-report.md 验证报告与设计决策
-
-postfix-maps/            生产用的 5 个 mysql: 映射（替换 PHP socketmap 守护）
-  mysql_virtual_mailbox_domains.cf
-  mysql_virtual_mailbox_maps.cf
-  mysql_virtual_alias_domains.cf
-  mysql_virtual_alias_maps.cf       # 优先级：1对1转发 > 真实邮箱 > catch-all
-  mysql_recipient_canonical.cf      # IDN -> ACE 规范化
-  postmap_test.sh                   # 全量回归（24 项，含 IDN 与优先级矩阵）
-  deploy_alias_priority.sh          # 部署别名映射 + 优先级矩阵验证
-  live_priority_test.sh             # 真实投递验证优先级（本地 vs catch-all）
-  local_delivery_test.sh / final_test.sh / live_test.sh   # 端到端投递验证
-inspect_migration.sh     迁移前盘点（磁盘/引用点/nic 状态）
-preflight.sh             迁移前预检（遗留 .db、maildir 列、lmtp 监听）
-migrate_vmail.sh         /www/vmail -> /data/vmail 一键迁移（含失败回滚）
-verify_migration.sh      迁移后验证（新路径投递/历史邮件/emoji IDN）
-90-quota.conf            Dovecot 2.4 配额后端修复块（quota maildir { }）
-fix_authsql.py           还原 auth-sql.conf.ext 的 userdb quota 写法
-deploy_quota_fix.sh      配额修复部署脚本（备份+部署+reload+校验）
 patch_leading_at.py      给 kc_idn.c 打"保留前导 @"补丁（幂等锚点校验）
-full_sweep.sql           全表扫描：验证 UDF 改动没损坏任何存量行
-identity_check.sql       统计 alias_domain 里恒等映射 vs 真别名域的数量
+create.sql / drop.sql    CREATE / DROP FUNCTION（注册与卸载 UDF）
+verify_udf.sql           UDF 自测（前导@、catch-all 键、emoji、哨兵值等）
+smoke.sql                注册 + 示例 + 往返冒烟
 ```
 
 ## License
